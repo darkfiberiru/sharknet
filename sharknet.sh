@@ -1,4 +1,4 @@
-#!/bin/sh -xv
+#!/bin/sh
 #
 # Copyright (c) 2019 Nick Wolff (iXsystems) 
 # All rights reserved
@@ -51,6 +51,11 @@
 #FreeNAS = First ip in network 
 #Client Default gateway = Second ip in network
 #Clients = Rest of network excluding broadcast address
+#
+#
+#TODO Features
+#  * Nat for inside network/dhcp for jail external ip 
+#  * Vpn setup (openvpn initial/zero tier later)
 #==================
 #set -xv
 
@@ -121,6 +126,7 @@ jailSetup() {
   intip="$( getIntIp ${network} )"
   nasip="$( getNasIp ${network} )"
   ifconfig bridge${i} create addm ${interface} up
+  #TODO dnsmasq is not getting installed via pkg list need to fix
   iocage create -n sharknet${i} -r 11.2-RELEASE -p /tmp/sharknet-pkgs vnet=on \
     devfs_ruleset=2  ip4_addr="vnet0|${extip},vnet1|${intip}" interfaces="vnet0:bridge255,vnet1:bridge${i}"  \
 	defaultrouter="${extdefault}" vnet_default_interface="${extinterface}"
@@ -130,15 +136,20 @@ jailSetup() {
     dns="${dns} -S ${server}"
   done
   jailrc="/mnt/${pool}/iocage/jails/sharknet${i}/root/etc/rc.local"
+  jailhosts="/mnt/${pool}/iocage/jails/sharknet${i}/root/etc/hosts"
   touch ${jailrc} 
   chmod +x ${jailrc} 
   #Turn on routing inside jail
+  echo "$(echo ${nasip}|cut -d'/' -f1)		nas.local.ixsystems.com"  >> ${jailhosts}
+  echo "$(echo ${intip}|cut -d'/' -f1)		sharknet${i}.local.ixsystems.com"  >> ${jailhosts}
   echo sysctl net.inet.ip.forwarding=1 >> ${jailrc}
+  #Messed up pkg list above somehow. Workaround to fix that
+  ASSUME_ALWAYS_YES=yes pkg install dnsmasq >> ${jailrc}
   first="$( getFirstDhcp ${network} )"
   last="$( getLastDhcp ${network} )"
   #Setup DNS and dhcp for internal network
   #The inside jail part of vnet1 interface is mapped as epair1b
-  echo dnsmasq -i epair1b ${dns} --no-resolv  -F ${first},${last} >> ${jailrc}
+  echo dnsmasq -i epair1b ${dns} --no-resolv  -F ${first},${last}  >> ${jailrc}
   #Full stop and start of jail to reload rc.local file
   iocage stop sharknet${i}
   iocage start sharknet${i}
