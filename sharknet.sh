@@ -56,6 +56,7 @@
 #TODO Features
 #  * Nat for inside network/dhcp for jail external ip 
 #  * Vpn setup (openvpn initial/zero tier later)
+#  * Ipv6 support
 #==================
 #set -xv
 
@@ -90,7 +91,7 @@ configureInterface() {
 
 #General system setup
 initialSetup() {
-  echo '{ "pkgs": [ "dnsmasq" ] }' > /tmp/sharknet-pkgs
+  echo '{ "pkgs": [ "dnsmasq" ] }' > /tmp/sharknet-pkgs.json
   ifconfig bridge255 create addm ${extinterface} up
   postInit "ifconfig bridge255 create addm ${extinterface} up"
 }
@@ -116,35 +117,16 @@ getLastDhcp() {
   #Take a network and get the last IP for it's dhcp range
   echo -e  "import ipaddress\nx=ipaddress.ip_network('${1}',False)\nprint(x[-2])"|python
 }
-
-#Per Jail Setup
-jailSetup() {
-  i=${1}
-  interface=${2}
-  extip=${3}
-  network="$( getNetwork ${4} )"
-  intip="$( getIntIp ${network} )"
-  nasip="$( getNasIp ${network} )"
-  ifconfig bridge${i} create addm ${interface} up
-  #TODO dnsmasq is not getting installed via pkg list need to fix
-  iocage create -n sharknet${i} -r 11.2-RELEASE -p /tmp/sharknet-pkgs vnet=on \
-    devfs_ruleset=2  ip4_addr="vnet0|${extip},vnet1|${intip}" interfaces="vnet0:bridge255,vnet1:bridge${i}"  \
-	defaultrouter="${extdefault}" vnet_default_interface="${extinterface}"
-  echo "Please setup a static route for network ${network} with the gateway ${extip} on your router"
+jailCommon() {
   dns=""
   for server in ${dnsservers}; do
     dns="${dns} -S ${server}"
   done
-  jailrc="/mnt/${pool}/iocage/jails/sharknet${i}/root/etc/rc.local"
-  jailhosts="/mnt/${pool}/iocage/jails/sharknet${i}/root/etc/hosts"
   touch ${jailrc} 
   chmod +x ${jailrc} 
   #Turn on routing inside jail
   echo "$(echo ${nasip}|cut -d'/' -f1)		nas.local.ixsystems.com"  >> ${jailhosts}
   echo "$(echo ${intip}|cut -d'/' -f1)		sharknet${i}.local.ixsystems.com"  >> ${jailhosts}
-  echo sysctl net.inet.ip.forwarding=1 >> ${jailrc}
-  #Messed up pkg list above somehow. Workaround to fix that
-  ASSUME_ALWAYS_YES=yes pkg install dnsmasq >> ${jailrc}
   first="$( getFirstDhcp ${network} )"
   last="$( getLastDhcp ${network} )"
   #Setup DNS and dhcp for internal network
@@ -156,7 +138,41 @@ jailSetup() {
   #TODO ASSIGN IP TO INTERFACE THROUGH FREENAS API
   echo "Please assign ip ${nasip} to  interface ${2} in the UI"
   postInit "ifconfig bridge${i} create addm ${interface} up"
+}
 
+jailRoutedSetup() {
+  iocage create -n sharknet${i} -r 11.2-RELEASE -p /tmp/sharknet-pkgs.json vnet=on \
+    devfs_ruleset=2  ip4_addr="vnet0|${extip},vnet1|${intip}" interfaces="vnet0:bridge255,vnet1:bridge${i}"  \
+	defaultrouter="${extdefault}" vnet_default_interface="${extinterface}"
+  echo "Please setup a static route for network ${network} with the gateway ${extip} on your router"
+  echo sysctl net.inet.ip.forwarding=1 >> ${jailrc}
+}
+
+jailNatSetup() {
+  iocage create -n sharknet${i} -r 11.2-RELEASE -p /tmp/sharknet-pkgs.json vnet=on \
+    devfs_ruleset=2  interfaces="vnet0:bridge255,vnet1:bridge${i}" dhcp=on bpf=on \
+    vnet_default_interface="${extinterface}"
+  kldload ipfw
+  echo sysctl net.inet.ip.fw.default_to_accept=1 >> ${jailrc}
+  echo sysctl net.inet.ip.forwarding=1 >> ${jailrc}
+  #'-tso4', '-lro', '-vlanhwtso'
+  #NATCONFIG borrowed and tweaked from iocage ioc_start.py Brandon Schneider @skarekrow
+  echo "ipfw -q nat 462 config if epair1b same_ports" >> ${jailrc}
+  echo "ipfw -q add 100 nat 462 ip4 from $nat_network to any out via epair1b" >> ${jailrc}
+  echo "ipfw -q add 101 nat 462 ip4 from any to any in via epair1b" >> ${jailrc}
+}
+
+#Per Jail Setup
+jailSetup() {
+  i=${1}
+  interface=${2}
+  extip=${3}
+  network="$( getNetwork ${4} )"
+  intip="$( getIntIp ${network} )"
+  nasip="$( getNasIp ${network} )"
+  ifconfig bridge${i} create addm ${interface} up
+  jailrc="/mnt/${pool}/iocage/jails/sharknet${i}/root/etc/rc.local"
+  jailhosts="/mnt/${pool}/iocage/jails/sharknet${i}/root/etc/hosts"
 }
 
 main() {
@@ -169,6 +185,7 @@ main() {
    internalinterface="$(echo $entry |cut -d '|' -f1)"
    externalip="$(echo $entry |cut -d '|' -f2)"
    internalip="$(echo $entry |cut -d '|' -f3)"
+   vpn="$(echo $entry |cut -d '|' -f4)"
    jailSetup ${i} ${internalinterface} ${externalip} ${internalip}
  done
 }
