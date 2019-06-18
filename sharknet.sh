@@ -68,14 +68,17 @@ pool="tank"
 dnsservers="10.215.1.8 8.8.8.8"
 
 #Command line argument is in format shown below
-#Natted Config=Space seperated list of sharknet configs in format:
-#       'External Interface|Internal Interface'
+#Direct Config=:
+#       "Internal Interface"
+#Natted Config=:
+#       "External Interface" "Internal Interface"
 #Routed Config= Space seperated list of sharknet configs in format:
-#       'External Interface|External Ip/Subnetmask|External Default Route|Internal Interface|Internal Network/Subnetmask'
+#       "External Interface     "External Ip/Subnetmask"     "External Default Route"   "Internal Interface"    "Internal Network/Subnetmask"
 #EXAMPLE: "
-#    vlan20|192.168.0.2/24|igb0|172.16.0.0/24"
-#    vlan20|igb2
-config="${1}"
+#    igb2
+#    vlan20 igb2
+#    vlan20 192.168.0.2/24 igb0 172.16.0.0/24"
+config="${1}|${2}|${3}|${4}|${5}"
 
 #END OF CONFIGURATION
 
@@ -95,8 +98,8 @@ createIntBridge() {
   interface="${1}"
   if ! ifconfig bridge-${1} ; then		
     bridge="$(ifconfig bridge create)"
-    ifconfig ${bridge} name bridge-${interface}
-    ifconfig bridge-${interface} addm ${interface} up
+    ifconfig ${bridge} name bridge-${interface} > /dev/null
+    ifconfig bridge-${interface} addm ${interface} up > /dev/null
     postInit "sh -c \" bridge=\\\"\$(ifconfig bridge create)\\\"; ifconfig \${bridge} name bridge-${interface}; ifconfig bridge-${interface} addm ${interface} up"
   fi
 }
@@ -104,7 +107,7 @@ createIntBridge() {
 #General system setup
 initialSetup() {
   echo '{ "pkgs": [ "dnsmasq" ] }' > /tmp/sharknet-pkgs.json
-  createIntBridge $(echo ${config} | cut -d'|' -f1)
+  createIntBridge "$(echo ${config} | cut -d'|' -f1)"
 }
 
 #Utility functions to deal with IPs
@@ -162,6 +165,7 @@ jailCommon() {
   #The inside jail part of vnet1 interface is mapped as epair1b so we don't need to pass it to dnsmasq
   createDnsmasqConfig ${network} ${root}
   #Start of jail to load rc.local file
+  iocage stop sharknet-${interface}
   iocage start sharknet-${interface}
   configureInterface ${interface} ${nasip}
 }
@@ -224,28 +228,19 @@ jailNatSetup() {
 }
 
 jailDirectSetup() {
-  extiface="$(echo ${config}|cut -d'|' -f1)"
-  intiface="$(echo ${config}|cut -d'|' -f2)"
+  intiface="$(echo ${config}|cut -d'|' -f1)"
   network="$(generateRndNet)" 
+  echo ${network}
   intip="$( getIntIp ${network} )"
   createIntBridge ${intiface}
   #Need to figure out how to fetch package so I can avoid outside network needs
   iocage create -n sharknet-${intiface} -r 11.2-RELEASE vnet=on \
-    devfs_ruleset=2  ip4_addr="none" interfaces="vnet0:bridge-${extiface},vnet1:bridge-${intiface}" bpf=yes \
-    dhcp=on vnet_default_interface="none" defaultrouter="none"
+    devfs_ruleset=2  ip4_addr="vnet1|${intip}" interfaces="vnet1:bridge-${intiface}" bpf=yes \
+    vnet_default_interface="none" defaultrouter="none"
   jailrc="/mnt/${pool}/iocage/jails/sharknet-${intiface}/root/etc/rc.local"
   jailrcconf="/mnt/${pool}/iocage/jails/sharknet-${interface}/root/etc/rc.conf"
-  jaildhclient="/mnt/${pool}/iocage/jails/sharknet-${interface}/root/etc/dhclient.conf"
   touch ${jailrc} 
   chmod +x ${jailrc} 
-  #Bad network hacks to handle older iocage
-  echo timeout 8 >> ${jaildhclient}
-  echo pkill -f epair1b >> ${jailrc}
-  echo ifconfig epair1b -alias >> ${jailrc}
-  echo ifconfig epair1b ${intip} >> ${jailrc}
-  #nat config
-  echo sysctl net.inet.ip.fw.default_to_accept=1 >> ${jailrc}
-  echo sysctl net.inet.ip.fw.enable=1 >> ${jailrc}
   jailCommon ${intiface} ${network}
 
 }
@@ -254,15 +249,15 @@ jailDirectSetup() {
 main() {
   #Setup system		
   initialSetup
-  if [ -z "$(echo ${config} | cut -d'|' -f2)" ] ; then
-    jailDirectSetup
-  elif [ -z "$(echo ${config} | cut -d'|' -f4)" ] ; then
+  if [ "?${4}" != "?" ] ; then
+    jailRoutedSetup
+  elif [ "?${2}" != "?" ] ; then
     jailNatSetup
   else
-    jailRoutedSetup
+    jailDirectSetup
   fi
 }
 
 
-main
+main $@
 
