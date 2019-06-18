@@ -54,11 +54,10 @@
 #
 #
 #TODO Features
-#  * Nat for inside network/dhcp for jail external ip 
 #  * Vpn setup (openvpn initial/zero tier later)
 #  * Ipv6 support
 #==================
-set -xv
+#set -xv
 
 #CONFIGURATION SECTION
 
@@ -129,29 +128,42 @@ getLastDhcp() {
   #Take a network and get the last IP for it's dhcp range
   echo -e  "import ipaddress\nx=ipaddress.ip_network('${1}',False)\nprint(x[-2])"|python
 }
+
+createDnsmasqConfig() {
+  network=${1}
+  root=${2}
+  first="$(getFirstDhcp ${network} )"
+  last="$(getLastDhcp ${network} )"
+  ASSUME_ALWAYS_YES=YES pkg -r ${root} -R ${root}/etc/pkg install dnsmasq >/dev/null
+  dmconfig="${root}/usr/local/etc/dnsmasq.conf"
+  mkdir -p $(dirname ${dmconfig})
+  touch ${dmconfig}
+  echo 'dnsmasq_enable="YES"' >> ${root}/etc/rc.conf
+  echo interface=epair1b >> ${dmconfig}
+  echo no-resolv >> ${dmconfig}
+  for server in ${dnsservers}; do
+    echo server=${server} >> ${dmconfig}
+  done
+  echo dhcp-range=${first},${last} >> ${dmconfig}
+}
+
 jailCommon() {
   interface="${1}"
   network="${2}"
   nasip="$( getNasIp ${network} )"
-  dns=""
-  for server in ${dnsservers}; do
-    dns="${dns} -S ${server}"
-  done
-  jailrc="/mnt/${pool}/iocage/jails/sharknet-${interface}/root/etc/rc.local"
-  jailhosts="/mnt/${pool}/iocage/jails/sharknet-${interface}/root/etc/hosts"
+  root="/mnt/${pool}/iocage/jails/sharknet-${interface}/root"
+  jailrc="${root}/etc/rc.local"
+  jailhosts="${root}/etc/hosts"
   #Turn on routing inside jail
   echo sysctl net.inet.ip.forwarding=1 >> ${jailrc}
   echo "$(echo ${nasip}|cut -d'/' -f1)		nas.local.ixsystems.com"  >> ${jailhosts}
   echo "$(echo ${intip}|cut -d'/' -f1)		sharknet-${interface}.local.ixsystems.com"  >> ${jailhosts}
-  first="$( getFirstDhcp ${network} )"
-  last="$( getLastDhcp ${network} )"
   #Setup DNS and dhcp for internal network
-  #The inside jail part of vnet1 interface is mapped as epair1b
-  echo dnsmasq -i epair1b ${dns} --no-resolv  -F ${first},${last}  >> ${jailrc}
+  #The inside jail part of vnet1 interface is mapped as epair1b so we don't need to pass it to dnsmasq
+  createDnsmasqConfig ${network} ${root}
   #Start of jail to load rc.local file
   iocage start sharknet-${interface}
-  #TODO ASSIGN IP TO INTERFACE THROUGH FREENAS API
-  echo "Please assign ip ${nasip} to  interface ${interface} in the UI"
+  configureInterface ${interface} ${nasip}
 }
 
 jailRoutedSetup() {
@@ -169,35 +181,71 @@ jailRoutedSetup() {
   touch ${jailrc} 
   chmod +x ${jailrc} 
   echo "Please setup a static route for network ${network} with the gateway ${extip} on your router"
-  jailCommon ${intiface} ${network}
+  jailCommon ${intiface} ${network} 
+}
+
+generateRndNet() {
+  second=$(jot -r 1 16 32)
+  third=$(jot -r 1 4 250)
+  echo "172.${second}.${third}.0/24"
 }
 
 
 jailNatSetup() {
   extiface="$(echo ${config}|cut -d'|' -f1)"
   intiface="$(echo ${config}|cut -d'|' -f2)"
-  network="172.24.9.0/24" 
+  network="$(generateRndNet)" 
   intip="$( getIntIp ${network} )"
   createIntBridge ${intiface}
-  #Using an undocumented feature of iocage to set one port as dhcp and other as static
   iocage create -n sharknet-${intiface} -r 11.2-RELEASE vnet=on \
-    devfs_ruleset=2  ip4_addr="vnet0|DHCP,vnet1|${intip}", interfaces="vnet0:bridge-${extiface},vnet1:bridge-${intiface}"  bpf=yes \
-    vnet_default_interface="${extiface}"
+    devfs_ruleset=2  ip4_addr="none" interfaces="vnet0:bridge-${extiface},vnet1:bridge-${intiface}" bpf=yes \
+    dhcp=on vnet_default_interface="none" defaultrouter="none"
   jailrc="/mnt/${pool}/iocage/jails/sharknet-${intiface}/root/etc/rc.local"
   jailrcconf="/mnt/${pool}/iocage/jails/sharknet-${interface}/root/etc/rc.conf"
+  jaildhclient="/mnt/${pool}/iocage/jails/sharknet-${interface}/root/etc/dhclient.conf"
   touch ${jailrc} 
   chmod +x ${jailrc} 
   kldload ipfw
+  #Bad network hacks to handle older iocage
+  echo timeout 8 >> ${jaildhclient}
+  echo pkill -f epair1b >> ${jailrc}
+  echo ifconfig epair1b -alias >> ${jailrc}
+  echo ifconfig epair1b ${intip} >> ${jailrc}
+  #nat config
   echo sysctl net.inet.ip.fw.default_to_accept=1 >> ${jailrc}
   echo sysctl net.inet.ip.fw.enable=1 >> ${jailrc}
-  #echo ifconfig_epair0b=\"DHCP\" >> ${jailrcconf}
-  #echo ifconfig_epair1b=\"inet ${intip} up\" >> ${jailrcconf}
-
-  #'-tso4', '-lro', '-vlanhwtso'
   #NATCONFIG borrowed and tweaked from iocage ioc_start.py Brandon Schneider @skarekrow
+  #'-tso4', '-lro', '-vlanhwtso'
   echo "ipfw -q nat 462 config if epair1b same_ports" >> ${jailrc}
   echo "ipfw -q add 100 nat 462 ip4 from not me to any out via epair1b" >> ${jailrc} 
   echo "ipfw -q add 101 nat 462 ip4 from any to any in via epair1b" >> ${jailrc}
+  jailCommon ${intiface} ${network}
+
+}
+
+jailDirectSetup() {
+  extiface="$(echo ${config}|cut -d'|' -f1)"
+  intiface="$(echo ${config}|cut -d'|' -f2)"
+  network="$(generateRndNet)" 
+  intip="$( getIntIp ${network} )"
+  createIntBridge ${intiface}
+  #Need to figure out how to fetch package so I can avoid outside network needs
+  iocage create -n sharknet-${intiface} -r 11.2-RELEASE vnet=on \
+    devfs_ruleset=2  ip4_addr="none" interfaces="vnet0:bridge-${extiface},vnet1:bridge-${intiface}" bpf=yes \
+    dhcp=on vnet_default_interface="none" defaultrouter="none"
+  jailrc="/mnt/${pool}/iocage/jails/sharknet-${intiface}/root/etc/rc.local"
+  jailrcconf="/mnt/${pool}/iocage/jails/sharknet-${interface}/root/etc/rc.conf"
+  jaildhclient="/mnt/${pool}/iocage/jails/sharknet-${interface}/root/etc/dhclient.conf"
+  touch ${jailrc} 
+  chmod +x ${jailrc} 
+  #Bad network hacks to handle older iocage
+  echo timeout 8 >> ${jaildhclient}
+  echo pkill -f epair1b >> ${jailrc}
+  echo ifconfig epair1b -alias >> ${jailrc}
+  echo ifconfig epair1b ${intip} >> ${jailrc}
+  #nat config
+  echo sysctl net.inet.ip.fw.default_to_accept=1 >> ${jailrc}
+  echo sysctl net.inet.ip.fw.enable=1 >> ${jailrc}
   jailCommon ${intiface} ${network}
 
 }
@@ -206,7 +254,9 @@ jailNatSetup() {
 main() {
   #Setup system		
   initialSetup
-  if [ -z "$(echo ${config} | cut -d'|' -f4)" ] ; then
+  if [ -z "$(echo ${config} | cut -d'|' -f2)" ] ; then
+    jailDirectSetup
+  elif [ -z "$(echo ${config} | cut -d'|' -f4)" ] ; then
     jailNatSetup
   else
     jailRoutedSetup
