@@ -247,7 +247,11 @@ jailDirectSetup() {
 
 
 main() {
-  #Setup system		
+  #Setup system
+  if [ "?${1}" != "?" ] ; then
+    echo "Please supply atleast 1 argument if your doing a direct config"
+    exit
+  fi
   initialSetup
   if [ "?${4}" != "?" ] ; then
     jailRoutedSetup
